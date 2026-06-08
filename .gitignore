@@ -1,0 +1,8 @@
+*.exe
+data/config.json
+data/*.db
+data/*.log
+.env
+.env.*
+.claude/
+third_party/**/.claude/

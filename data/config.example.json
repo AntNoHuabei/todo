@@ -1,0 +1,19 @@
+{
+  "model": {
+    "base_url": "https://example.com/v1",
+    "api_key": "replace-me",
+    "model": "gpt-5.5",
+    "temperature": 0.2
+  },
+  "wecom": {
+    "bot_id": "replace-me",
+    "secret": "replace-me",
+    "websocket_url": "wss://openws.work.weixin.qq.com",
+    "home_chat_id": ""
+  },
+  "local": {
+    "timezone": "Local",
+    "data_dir": "",
+    "log_level": "info"
+  }
+}
