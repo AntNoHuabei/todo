@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"todo-assistant/internal/config"
+	"todo-assistant/internal/memo"
 	"todo-assistant/internal/todo"
 
 	trpcmemoryinmem "trpc.group/trpc-go/trpc-agent-go/memory/inmemory"
@@ -424,5 +425,174 @@ func TestAgentMemoryCommandsAddListDelete(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("memory was not deleted: %#v", entries)
+	}
+}
+
+func TestAgentLLMMemoCreateDoesNotCreateTodo(t *testing.T) {
+	var requests int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		body, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		if requests == 1 {
+			fmt.Fprint(w, `{"id":"intent_1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"{\"op\":\"memo_create\",\"todo_related\":true,\"confidence\":0.98}"},"finish_reason":"stop"}]}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch requests {
+		case 2:
+			if !strings.Contains(string(body), `"memo_create"`) || strings.Contains(string(body), `"todo_create"`) {
+				t.Fatalf("expected only memo create tool, got %s", string(body))
+			}
+			writeSSE(w, `{"id":"cmpl_1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_memo","type":"function","function":{"name":"memo_create","arguments":"{\"title\":\"Phison 项目地址\",\"content\":\"项目地址是 https://example.com/phison\",\"tags\":[\"phison\"]}"}}]},"finish_reason":null}]}`)
+			writeSSE(w, `{"id":"cmpl_1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`)
+			writeSSE(w, `[DONE]`)
+		case 3:
+			if !strings.Contains(string(body), `"role":"tool"`) || !strings.Contains(string(body), `"call_memo"`) {
+				t.Fatalf("expected memo tool result, got %s", string(body))
+			}
+			writeSSE(w, `{"id":"cmpl_2","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"已保存 Phison 项目地址。"},"finish_reason":null}]}`)
+			writeSSE(w, `{"id":"cmpl_2","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`)
+			writeSSE(w, `[DONE]`)
+		default:
+			t.Fatalf("unexpected request %d: %s", requests, string(body))
+		}
+	}))
+	defer srv.Close()
+
+	loc := time.FixedZone("CST", 8*3600)
+	todoStore, err := todo.NewStore(filepath.Join(t.TempDir(), "todos.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	memoStore, err := memo.NewStore(filepath.Join(t.TempDir(), "memos.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	todoSvc := todo.NewService(todoStore, loc)
+	memoSvc := memo.NewService(memoStore, loc)
+	model := NewOpenAIClient(config.ModelConfig{BaseURL: srv.URL + "/v1", APIKey: "key", Model: "test"})
+	a := NewWithMemo(model, todoSvc, memoSvc, loc)
+
+	reply, err := a.HandleText(context.Background(), "记一下 phison 项目地址是 https://example.com/phison")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(reply, "Phison") {
+		t.Fatalf("unexpected reply %q", reply)
+	}
+	todos, err := todoSvc.List(todo.Filter{IncludeDeleted: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(todos) != 0 {
+		t.Fatalf("memo create should not create todo: %#v", todos)
+	}
+	memos, err := memoSvc.List(memo.Filter{Query: "phison"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(memos) != 1 || len(memos[0].Links) != 1 {
+		t.Fatalf("memo was not saved with link: %#v", memos)
+	}
+}
+
+func TestAgentLLMMemoDeleteSearchesBeforeDelete(t *testing.T) {
+	var requests int
+	var memoID string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		body, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		if requests == 1 {
+			fmt.Fprint(w, `{"id":"intent_1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"{\"op\":\"memo_delete\",\"todo_related\":true,\"confidence\":0.97}"},"finish_reason":"stop"}]}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch requests {
+		case 2:
+			if !strings.Contains(string(body), `"memo_search"`) || !strings.Contains(string(body), `"memo_delete"`) || strings.Contains(string(body), `"todo_delete"`) {
+				t.Fatalf("expected memo search/delete tools, got %s", string(body))
+			}
+			writeSSE(w, `{"id":"cmpl_search","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_search","type":"function","function":{"name":"memo_search","arguments":"{\"query\":\"phison 链接\"}"}}]},"finish_reason":null}]}`)
+			writeSSE(w, `{"id":"cmpl_search","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`)
+			writeSSE(w, `[DONE]`)
+		case 3:
+			if !strings.Contains(string(body), `"call_search"`) {
+				t.Fatalf("expected search result, got %s", string(body))
+			}
+			fmt.Fprintf(w, "data: %s\n\n", fmt.Sprintf(`{"id":"cmpl_delete","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_delete","type":"function","function":{"name":"memo_delete","arguments":"{\"id\":\"%s\"}"}}]},"finish_reason":null}]}`, memoID))
+			writeSSE(w, `{"id":"cmpl_delete","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`)
+			writeSSE(w, `[DONE]`)
+		case 4:
+			if !strings.Contains(string(body), `"call_delete"`) {
+				t.Fatalf("expected delete result, got %s", string(body))
+			}
+			writeSSE(w, `{"id":"cmpl_final","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"已删除 Phison 链接备忘录。"},"finish_reason":null}]}`)
+			writeSSE(w, `{"id":"cmpl_final","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`)
+			writeSSE(w, `[DONE]`)
+		default:
+			t.Fatalf("unexpected request %d: %s", requests, string(body))
+		}
+	}))
+	defer srv.Close()
+
+	loc := time.FixedZone("CST", 8*3600)
+	todoStore, err := todo.NewStore(filepath.Join(t.TempDir(), "todos.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	memoStore, err := memo.NewStore(filepath.Join(t.TempDir(), "memos.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	todoSvc := todo.NewService(todoStore, loc)
+	memoSvc := memo.NewService(memoStore, loc)
+	existing, err := memoSvc.Create(memo.CreateInput{Title: "Phison 项目链接", Content: "https://example.com/phison", Tags: []string{"phison"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	memoID = existing.ID
+	model := NewOpenAIClient(config.ModelConfig{BaseURL: srv.URL + "/v1", APIKey: "key", Model: "test"})
+	a := NewWithMemo(model, todoSvc, memoSvc, loc)
+
+	reply, err := a.HandleText(context.Background(), "把 phison 那条链接删掉")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(reply, "已删除") {
+		t.Fatalf("unexpected reply %q", reply)
+	}
+	items, err := memoSvc.List(memo.Filter{Query: "phison"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("deleted memo should be hidden: %#v", items)
+	}
+}
+
+func TestAgentReminderAboutLinkStillCreatesTodoWithoutModel(t *testing.T) {
+	loc := time.FixedZone("CST", 8*3600)
+	store, err := todo.NewStore(filepath.Join(t.TempDir(), "todos.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := todo.NewService(store, loc)
+	a := New(nil, svc, loc)
+
+	reply, err := a.HandleText(context.Background(), "提醒我明天看 https://example.com/phison")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(reply, "已创建") {
+		t.Fatalf("unexpected reply %q", reply)
+	}
+	items, err := svc.List(todo.Filter{Status: todo.StatusOpen})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected todo reminder, got %#v", items)
 	}
 }

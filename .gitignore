@@ -1,4 +1,5 @@
 *.exe
+*.exe~
 data/config.json
 data/*.db
 data/*.log

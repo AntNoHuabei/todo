@@ -17,6 +17,7 @@ import (
 
 	"todo-assistant/internal/agent"
 	"todo-assistant/internal/config"
+	"todo-assistant/internal/memo"
 	"todo-assistant/internal/scheduler"
 	"todo-assistant/internal/todo"
 	"todo-assistant/internal/tui"
@@ -79,6 +80,14 @@ func openStore(cfg config.Config) (*todo.Store, error) {
 	return todo.NewStore(filepath.Join(dataDir, "todos.json"))
 }
 
+func openMemoStore(cfg config.Config) (*memo.Store, error) {
+	dataDir := cfg.Local.DataDir
+	if dataDir == "" {
+		dataDir = config.DefaultDataDir()
+	}
+	return memo.NewStore(filepath.Join(dataDir, "memos.json"))
+}
+
 func setupLogger(cfg config.Config) (*os.File, error) {
 	dataDir := cfg.Local.DataDir
 	if dataDir == "" {
@@ -139,8 +148,13 @@ func runServe(args []string) error {
 		return err
 	}
 	svc := todo.NewService(store, loc)
+	memoStore, err := openMemoStore(cfg)
+	if err != nil {
+		return err
+	}
+	memoSvc := memo.NewService(memoStore, loc)
 	model := agent.NewOpenAIClient(cfg.Model)
-	assistant, err := agent.NewWithSQLite(model, svc, loc, cfg.Local.DataDir)
+	assistant, err := agent.NewWithSQLiteAndMemo(model, svc, memoSvc, loc, cfg.Local.DataDir)
 	if err != nil {
 		return fmt.Errorf("open sqlite agent runtime: %w", err)
 	}
@@ -159,6 +173,7 @@ func runServe(args []string) error {
 	wc.OnText(func(ctx context.Context, msg wecom.InboundText) {
 		log.Printf("wecom inbound: req_id=%s msg_id=%s chat_id=%s user_id=%s text=%q", msg.Frame.Headers.ReqID, msg.MsgID, msg.ChatID, msg.UserID, msg.Text)
 		ctx = todo.WithChatID(ctx, msg.ChatID)
+		ctx = memo.WithChatID(ctx, msg.ChatID)
 		if cfg.WeCom.HomeChatID == "" && msg.ChatID != "" {
 			cfg.WeCom.HomeChatID = msg.ChatID
 			_ = config.Save(*configPath, cfg)
@@ -271,6 +286,15 @@ func runDoctor(args []string) error {
 		fmt.Println("storage: FAIL", err)
 	} else {
 		fmt.Println("storage: OK")
+	}
+	memoStore, err := openMemoStore(cfg)
+	if err != nil {
+		return err
+	}
+	if _, err := memoStore.List(); err != nil {
+		fmt.Println("memo storage: FAIL", err)
+	} else {
+		fmt.Println("memo storage: OK")
 	}
 	if cfg.Model.BaseURL == "" || cfg.Model.APIKey == "" || cfg.Model.Model == "" {
 		fmt.Println("model: SKIP missing base_url/api_key/model")

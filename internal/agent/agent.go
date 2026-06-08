@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"todo-assistant/internal/config"
+	"todo-assistant/internal/memo"
 	"todo-assistant/internal/todo"
 
 	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
@@ -39,16 +40,21 @@ const (
 type intentOp string
 
 const (
-	opChat     intentOp = "chat"
-	opUnknown  intentOp = "unknown"
-	opCreate   intentOp = "create"
-	opList     intentOp = "list"
-	opUpdate   intentOp = "update"
-	opDelete   intentOp = "delete"
-	opComplete intentOp = "complete"
-	opReopen   intentOp = "reopen"
-	opSnooze   intentOp = "snooze"
-	opSummary  intentOp = "summary"
+	opChat       intentOp = "chat"
+	opUnknown    intentOp = "unknown"
+	opCreate     intentOp = "create"
+	opList       intentOp = "list"
+	opUpdate     intentOp = "update"
+	opDelete     intentOp = "delete"
+	opComplete   intentOp = "complete"
+	opReopen     intentOp = "reopen"
+	opSnooze     intentOp = "snooze"
+	opSummary    intentOp = "summary"
+	opMemoCreate intentOp = "memo_create"
+	opMemoSearch intentOp = "memo_search"
+	opMemoUpdate intentOp = "memo_update"
+	opMemoDelete intentOp = "memo_delete"
+	opMemoList   intentOp = "memo_list"
 )
 
 type inputIntent struct {
@@ -69,32 +75,50 @@ type Agent struct {
 	model   *OpenAIClient
 	runtime *AgentRuntime
 	tools   *todo.ToolExecutor
+	memos   *memo.ToolExecutor
 	svc     *todo.Service
+	memoSvc *memo.Service
 	loc     *time.Location
 }
 
 func New(model *OpenAIClient, svc *todo.Service, loc *time.Location) *Agent {
+	return NewWithMemo(model, svc, nil, loc)
+}
+
+func NewWithMemo(model *OpenAIClient, svc *todo.Service, memoSvc *memo.Service, loc *time.Location) *Agent {
 	if loc == nil {
 		loc = time.Local
 	}
 	tools := todo.NewToolExecutor(svc, loc)
+	var memoTools *memo.ToolExecutor
+	if memoSvc != nil {
+		memoTools = memo.NewToolExecutor(memoSvc, loc)
+	}
 	var runtime *AgentRuntime
 	if model != nil {
-		runtime = NewAgentRuntime(model, tools, loc)
+		runtime = NewAgentRuntime(model, tools, memoTools, loc)
 	}
-	return &Agent{model: model, runtime: runtime, tools: tools, svc: svc, loc: loc}
+	return &Agent{model: model, runtime: runtime, tools: tools, memos: memoTools, svc: svc, memoSvc: memoSvc, loc: loc}
 }
 
 func NewWithSQLite(model *OpenAIClient, svc *todo.Service, loc *time.Location, dataDir string) (*Agent, error) {
+	return NewWithSQLiteAndMemo(model, svc, nil, loc, dataDir)
+}
+
+func NewWithSQLiteAndMemo(model *OpenAIClient, svc *todo.Service, memoSvc *memo.Service, loc *time.Location, dataDir string) (*Agent, error) {
 	if loc == nil {
 		loc = time.Local
 	}
 	tools := todo.NewToolExecutor(svc, loc)
-	runtime, err := NewSQLiteAgentRuntime(model, tools, loc, dataDir)
+	var memoTools *memo.ToolExecutor
+	if memoSvc != nil {
+		memoTools = memo.NewToolExecutor(memoSvc, loc)
+	}
+	runtime, err := NewSQLiteAgentRuntime(model, tools, memoTools, loc, dataDir)
 	if err != nil {
 		return nil, err
 	}
-	return &Agent{model: model, runtime: runtime, tools: tools, svc: svc, loc: loc}, nil
+	return &Agent{model: model, runtime: runtime, tools: tools, memos: memoTools, svc: svc, memoSvc: memoSvc, loc: loc}, nil
 }
 
 func (a *Agent) Close() error {
@@ -136,6 +160,9 @@ func (a *Agent) HandleTextStream(ctx context.Context, text string, onDelta func(
 	}
 	if reply, ok, err := a.ruleBasedTimeUpdate(ctx, intent, text); ok || err != nil {
 		return reply, err
+	}
+	if looksLikeMemoIntent(text) && intent.Op != opCreate && (a.model == nil || !a.model.IsConfigured()) {
+		return "模型还没配置好，无法智能识别备忘录。你可以先配置模型后再说“记一下项目链接是 ...”。", nil
 	}
 	if call, ok := a.ruleBasedCall(intent, text); ok {
 		res, err := a.executeTool(ctx, intent, call)
@@ -317,7 +344,7 @@ func (a *Agent) runModelWithIntentTools(ctx context.Context, intent inputIntent,
 	}
 
 	sessionSvc, memorySvc := a.runtimeServices()
-	rt, err := newAgentRuntimeWithAllowedTools(a.model, a.tools, a.loc, systemPrompt(time.Now().In(a.loc)), sessionSvc, memorySvc, allowed, false)
+	rt, err := newAgentRuntimeWithAllowedTools(a.model, a.tools, a.memos, a.loc, systemPrompt(time.Now().In(a.loc)), sessionSvc, memorySvc, allowed, false)
 	if err != nil {
 		return "", err
 	}
@@ -369,7 +396,7 @@ func normalizeModelIntent(text string, mi modelIntent) (inputIntent, error) {
 	switch op {
 	case opChat:
 		intent.Op = opChat
-	case opCreate, opList, opUpdate, opDelete, opComplete, opReopen, opSnooze, opSummary, opUnknown:
+	case opCreate, opList, opUpdate, opDelete, opComplete, opReopen, opSnooze, opSummary, opMemoCreate, opMemoSearch, opMemoUpdate, opMemoDelete, opMemoList, opUnknown:
 		intent.Op = op
 		intent.TodoRelated = true
 	default:
@@ -382,7 +409,7 @@ func normalizeModelIntent(text string, mi modelIntent) (inputIntent, error) {
 		intent.TodoRelated = false
 	}
 	if intent.Op != opChat && !intent.TodoRelated {
-		return inputIntent{}, fmt.Errorf("todo op %q marked not todo-related", intent.Op)
+		return inputIntent{}, fmt.Errorf("tool op %q marked not tool-related", intent.Op)
 	}
 	if mi.Confidence > 0 && mi.Confidence < 0.45 {
 		return inputIntent{}, fmt.Errorf("low intent confidence %.2f", mi.Confidence)
@@ -420,6 +447,12 @@ func inputIntentFromContext(ctx context.Context) (inputIntent, bool) {
 	return intent, ok
 }
 
+type toolResultView struct {
+	Message   string
+	HasItem   bool
+	ItemCount int
+}
+
 func (a *Agent) executeTool(ctx context.Context, intent inputIntent, call todo.ToolCall) (todo.ToolResult, error) {
 	if err := validateToolCallAgainstIntent(intent, call.Name, call.Args); err != nil {
 		return todo.ToolResult{}, err
@@ -428,10 +461,18 @@ func (a *Agent) executeTool(ctx context.Context, intent inputIntent, call todo.T
 	if err != nil {
 		return res, err
 	}
-	if err := validateToolResultAgainstIntent(intent, call.Name, res); err != nil {
+	if err := validateToolResultAgainstIntent(intent, call.Name, todoResultView(res)); err != nil {
 		return todo.ToolResult{}, err
 	}
 	return res, nil
+}
+
+func todoResultView(res todo.ToolResult) toolResultView {
+	return toolResultView{Message: res.Message, HasItem: res.Item != nil, ItemCount: len(res.Items)}
+}
+
+func memoResultView(res memo.ToolResult) toolResultView {
+	return toolResultView{Message: res.Message, HasItem: res.Item != nil, ItemCount: len(res.Items)}
 }
 
 func validateToolCallAgainstIntent(intent inputIntent, toolName string, args map[string]interface{}) error {
@@ -454,20 +495,26 @@ func validateToolCallAgainstIntent(intent inputIntent, toolName string, args map
 	return nil
 }
 
-func validateToolResultAgainstIntent(intent inputIntent, toolName string, res todo.ToolResult) error {
+func validateToolResultAgainstIntent(intent inputIntent, toolName string, res toolResultView) error {
 	if !intent.TodoRelated {
 		return nil
 	}
 	switch intent.Op {
 	case opCreate:
-		if toolName == "todo.create" && res.Item == nil {
+		if toolName == "todo.create" && !res.HasItem {
 			return fmt.Errorf("创建操作没有返回新待办，已视为失败")
+		}
+	case opMemoCreate:
+		if toolName == "memo.create" && !res.HasItem {
+			return fmt.Errorf("创建操作没有返回新备忘录，已视为失败")
 		}
 	case opList, opSummary:
 		return nil
+	case opMemoSearch, opMemoList:
+		return nil
 	default:
-		if res.Item == nil && len(res.Items) == 0 {
-			return fmt.Errorf("工具执行后没有返回可核对的待办结果")
+		if !res.HasItem && res.ItemCount == 0 {
+			return fmt.Errorf("工具执行后没有返回可核对的结果")
 		}
 	}
 	return nil
@@ -491,6 +538,16 @@ func allowedToolsForIntent(op intentOp) map[string]bool {
 		return map[string]bool{"todo.list": true, "todo.snooze": true}
 	case opSummary:
 		return map[string]bool{"todo.summary": true, "todo.list": true}
+	case opMemoCreate:
+		return map[string]bool{"memo.create": true}
+	case opMemoSearch:
+		return map[string]bool{"memo.search": true, "memo.list": true}
+	case opMemoUpdate:
+		return map[string]bool{"memo.search": true, "memo.list": true, "memo.update": true}
+	case opMemoDelete:
+		return map[string]bool{"memo.search": true, "memo.list": true, "memo.delete": true}
+	case opMemoList:
+		return map[string]bool{"memo.list": true, "memo.search": true}
 	default:
 		return nil
 	}
@@ -498,7 +555,7 @@ func allowedToolsForIntent(op intentOp) map[string]bool {
 
 func requiresID(toolName string) bool {
 	switch toolName {
-	case "todo.update", "todo.delete", "todo.complete", "todo.reopen", "todo.snooze":
+	case "todo.update", "todo.delete", "todo.complete", "todo.reopen", "todo.snooze", "memo.update", "memo.delete":
 		return true
 	default:
 		return false
@@ -791,11 +848,26 @@ func mentionsTodo(text string) bool {
 		strings.Contains(text, "事项")
 }
 
+func looksLikeMemoIntent(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	return strings.Contains(text, "备忘") ||
+		strings.Contains(text, "记一下") ||
+		strings.Contains(text, "记下") ||
+		strings.Contains(text, "保存一下") ||
+		strings.Contains(text, "存一下") ||
+		strings.Contains(text, "项目链接") ||
+		strings.Contains(text, "资料链接") ||
+		strings.Contains(lower, "http://") ||
+		strings.Contains(lower, "https://")
+}
+
 func systemPrompt(now time.Time) string {
-	return fmt.Sprintf(`你是一个自然、温和、能正常聊天的中文待办助手。当前时间：%s。
-普通聊天时自然回复，不要调用工具。用户明确表达待办意图时，使用可用工具创建、查询或更新待办。
+	return fmt.Sprintf(`你是一个自然、温和、能正常聊天的中文待办和备忘录助手。当前时间：%s。
+普通聊天时自然回复，不要调用工具。用户明确表达待办意图时，使用 todo 工具；用户要保存或查询项目名、链接、资料片段、账号说明等资料时，使用 memo 工具。
 创建待办时，title 只保留核心事项，不要包含“提醒我、帮我记一下、到时候、要、一下”等口语壳，也不要包含日期、时间、优先级；日期时间放到 due_at，优先级放到 priority。
 删除、完成、重开、延后、更新这类需要 ID 的操作，如果用户没有直接给 ID，先用 todo_list 查找候选，再对匹配项调用对应工具；不要臆造 ID。
+保存备忘录时，title 一句话概括资料，content 保留正文说明，links 放链接，tags 放项目名、客户名、技术栈等关键词。查找、更新、删除备忘录时，如果用户没有直接给 ID，先用 memo_search 或 memo_list 查候选，再对匹配项调用对应工具；不要臆造 ID。
+“提醒我明天看某个链接”是待办；“记一下某个项目链接是...”是备忘录。
 工具执行后，用自然中文简短总结结果。priority 只能是 low, normal, high, urgent。`,
 		now.Format("2006-01-02 15:04"))
 }
@@ -857,13 +929,13 @@ func (c *OpenAIClient) ClassifyIntent(ctx context.Context, text string) (inputIn
 	}
 	temp := 0.0
 	maxTokens := 120
-	system := `你是待办助手的意图分类器。只输出 JSON，不要输出解释或 Markdown。
+	system := `你是待办和备忘录助手的意图分类器。只输出 JSON，不要输出解释或 Markdown。
 JSON 字段：
-- op: chat, create, list, update, delete, complete, reopen, snooze, summary, unknown
+- op: chat, create, list, update, delete, complete, reopen, snooze, summary, memo_create, memo_search, memo_update, memo_delete, memo_list, unknown
 - todo_related: boolean
 - confidence: 0 到 1 的数字
 含义：
-- chat: 普通聊天，不涉及待办操作
+- chat: 普通聊天，不涉及待办或备忘录操作
 - create: 创建新待办或提醒
 - list: 查询待办
 - update: 修改标题、备注、优先级、时间等
@@ -872,8 +944,15 @@ JSON 字段：
 - reopen: 重新打开
 - snooze: 延后提醒
 - summary: 总结待办
-- unknown: 涉及待办但操作不清楚
-如果用户要“删掉/删除/取消/移除”某些待办，op 必须是 delete，不要判成 list 或 create。`
+- memo_create: 保存项目名、链接、资料片段、账号说明等备忘录
+- memo_search: 查询或查找备忘录
+- memo_update: 更新备忘录
+- memo_delete: 删除备忘录
+- memo_list: 列出最近备忘录
+- unknown: 涉及待办或备忘录但操作不清楚
+如果用户要“删掉/删除/取消/移除”某些待办，op 必须是 delete，不要判成 list 或 create。
+如果用户说“记一下/保存一下/备忘一下”项目名、链接或资料，op 通常是 memo_create。
+如果用户说“提醒我明天看某链接/资料”，op 是 create，不是 memo_create。`
 	ch, err := c.model.GenerateContent(ctx, &trpcmodel.Request{
 		Messages: []trpcmodel.Message{
 			trpcmodel.NewSystemMessage(system),
@@ -924,7 +1003,7 @@ func (c *OpenAIClient) ChatWithToolsStream(ctx context.Context, system, user str
 	if !c.IsConfigured() {
 		return "", errors.New("missing model base_url/api_key/model")
 	}
-	rt, err := newAgentRuntime(c, tools, time.Local, system, nil, nil)
+	rt, err := newAgentRuntime(c, tools, nil, time.Local, system, nil, nil)
 	if err != nil {
 		return "", err
 	}
@@ -938,16 +1017,16 @@ type AgentRuntime struct {
 	closers    []io.Closer
 }
 
-func NewAgentRuntime(model *OpenAIClient, tools *todo.ToolExecutor, loc *time.Location) *AgentRuntime {
-	rt, err := newAgentRuntime(model, tools, loc, systemPrompt(time.Now().In(loc)), nil, nil)
+func NewAgentRuntime(model *OpenAIClient, tools *todo.ToolExecutor, memos *memo.ToolExecutor, loc *time.Location) *AgentRuntime {
+	rt, err := newAgentRuntime(model, tools, memos, loc, systemPrompt(time.Now().In(loc)), nil, nil)
 	if err != nil {
 		log.Printf("agent runtime sqlite session disabled: %v", err)
-		return newInMemoryAgentRuntime(model, tools, loc, systemPrompt(time.Now().In(loc)))
+		return newInMemoryAgentRuntime(model, tools, memos, loc, systemPrompt(time.Now().In(loc)))
 	}
 	return rt
 }
 
-func NewSQLiteAgentRuntime(model *OpenAIClient, tools *todo.ToolExecutor, loc *time.Location, dataDir string) (*AgentRuntime, error) {
+func NewSQLiteAgentRuntime(model *OpenAIClient, tools *todo.ToolExecutor, memos *memo.ToolExecutor, loc *time.Location, dataDir string) (*AgentRuntime, error) {
 	if dataDir == "" {
 		dataDir = config.DefaultDataDir()
 	}
@@ -976,26 +1055,26 @@ func NewSQLiteAgentRuntime(model *OpenAIClient, tools *todo.ToolExecutor, loc *t
 		return nil, err
 	}
 
-	return newAgentRuntime(model, tools, loc, systemPrompt(time.Now().In(loc)), sessionSvc, memorySvc)
+	return newAgentRuntime(model, tools, memos, loc, systemPrompt(time.Now().In(loc)), sessionSvc, memorySvc)
 }
 
-func newInMemoryAgentRuntime(model *OpenAIClient, tools *todo.ToolExecutor, loc *time.Location, instruction string) *AgentRuntime {
-	rt, err := newAgentRuntime(model, tools, loc, instruction, nil, nil)
+func newInMemoryAgentRuntime(model *OpenAIClient, tools *todo.ToolExecutor, memos *memo.ToolExecutor, loc *time.Location, instruction string) *AgentRuntime {
+	rt, err := newAgentRuntime(model, tools, memos, loc, instruction, nil, nil)
 	if err != nil {
 		panic(err)
 	}
 	return rt
 }
 
-func newAgentRuntime(model *OpenAIClient, tools *todo.ToolExecutor, loc *time.Location, instruction string, sessionSvc trpcsession.Service, memorySvc trpcmemory.Service) (*AgentRuntime, error) {
-	return newAgentRuntimeWithAllowedTools(model, tools, loc, instruction, sessionSvc, memorySvc, nil, true)
+func newAgentRuntime(model *OpenAIClient, tools *todo.ToolExecutor, memos *memo.ToolExecutor, loc *time.Location, instruction string, sessionSvc trpcsession.Service, memorySvc trpcmemory.Service) (*AgentRuntime, error) {
+	return newAgentRuntimeWithAllowedTools(model, tools, memos, loc, instruction, sessionSvc, memorySvc, nil, true)
 }
 
-func newAgentRuntimeWithAllowedTools(model *OpenAIClient, tools *todo.ToolExecutor, loc *time.Location, instruction string, sessionSvc trpcsession.Service, memorySvc trpcmemory.Service, allowed map[string]bool, closeServices bool) (*AgentRuntime, error) {
+func newAgentRuntimeWithAllowedTools(model *OpenAIClient, tools *todo.ToolExecutor, memos *memo.ToolExecutor, loc *time.Location, instruction string, sessionSvc trpcsession.Service, memorySvc trpcmemory.Service, allowed map[string]bool, closeServices bool) (*AgentRuntime, error) {
 	if loc == nil {
 		loc = time.Local
 	}
-	agentTools := todoAgentTools(tools)
+	agentTools := agentTools(tools, memos)
 	if allowed != nil {
 		agentTools = filterAgentTools(agentTools, allowed)
 	}
@@ -1043,7 +1122,7 @@ func filterAgentTools(tools []trpctool.Tool, allowed map[string]bool) []trpctool
 	}
 	out := make([]trpctool.Tool, 0, len(tools))
 	for _, tool := range tools {
-		if named, ok := tool.(*todoTool); ok && allowed[named.todoName] {
+		if named, ok := tool.(*agentTool); ok && allowed[named.domainName] {
 			out = append(out, tool)
 		}
 	}
@@ -1192,15 +1271,15 @@ func (r *AgentRuntime) Run(ctx context.Context, userID, sessionID, text string, 
 	return strings.TrimSpace(streamed.String()), nil
 }
 
-type todoTool struct {
+type agentTool struct {
 	name        string
-	todoName    string
+	domainName  string
 	description string
 	inputSchema *trpctool.Schema
-	exec        *todo.ToolExecutor
+	call        func(context.Context, map[string]interface{}) (any, toolResultView, error)
 }
 
-func (t *todoTool) Declaration() *trpctool.Declaration {
+func (t *agentTool) Declaration() *trpctool.Declaration {
 	return &trpctool.Declaration{
 		Name:        t.name,
 		Description: t.description,
@@ -1208,7 +1287,7 @@ func (t *todoTool) Declaration() *trpctool.Declaration {
 	}
 }
 
-func (t *todoTool) Call(ctx context.Context, jsonArgs []byte) (any, error) {
+func (t *agentTool) Call(ctx context.Context, jsonArgs []byte) (any, error) {
 	args := map[string]interface{}{}
 	if len(strings.TrimSpace(string(jsonArgs))) > 0 {
 		if err := json.Unmarshal(jsonArgs, &args); err != nil {
@@ -1216,24 +1295,35 @@ func (t *todoTool) Call(ctx context.Context, jsonArgs []byte) (any, error) {
 		}
 	}
 	if intent, ok := inputIntentFromContext(ctx); ok {
-		if err := validateToolCallAgainstIntent(intent, t.todoName, args); err != nil {
+		if err := validateToolCallAgainstIntent(intent, t.domainName, args); err != nil {
 			return nil, err
 		}
 	}
-	res, err := t.exec.ExecuteContext(ctx, todo.ToolCall{Name: t.todoName, Args: args})
+	res, view, err := t.call(ctx, args)
 	if err != nil {
 		return nil, err
 	}
 	if intent, ok := inputIntentFromContext(ctx); ok {
-		if err := validateToolResultAgainstIntent(intent, t.todoName, res); err != nil {
+		if err := validateToolResultAgainstIntent(intent, t.domainName, view); err != nil {
 			return nil, err
 		}
 	}
-	log.Printf("agent tool call: name=%s args=%s result=%s", t.name, string(jsonArgs), res.Message)
+	log.Printf("agent tool call: name=%s args=%s result=%s", t.name, string(jsonArgs), view.Message)
 	return res, nil
 }
 
+func agentTools(todoExec *todo.ToolExecutor, memoExec *memo.ToolExecutor) []trpctool.Tool {
+	tools := todoAgentTools(todoExec)
+	if memoExec != nil {
+		tools = append(tools, memoAgentTools(memoExec)...)
+	}
+	return tools
+}
+
 func todoAgentTools(exec *todo.ToolExecutor) []trpctool.Tool {
+	if exec == nil {
+		return nil
+	}
 	return []trpctool.Tool{
 		newTodoTool(exec, "todo_create", "创建一个新的待办事项。", "todo.create", objectSchema(
 			properties(
@@ -1278,8 +1368,72 @@ func todoAgentTools(exec *todo.ToolExecutor) []trpctool.Tool {
 	}
 }
 
-func newTodoTool(exec *todo.ToolExecutor, name, description, todoName string, schema *trpctool.Schema) *todoTool {
-	return &todoTool{name: name, description: description, todoName: todoName, inputSchema: schema, exec: exec}
+func memoAgentTools(exec *memo.ToolExecutor) []trpctool.Tool {
+	if exec == nil {
+		return nil
+	}
+	return []trpctool.Tool{
+		newMemoTool(exec, "memo_create", "保存一条备忘录资料，用于项目名、链接、账号说明、资料片段等长期可查信息。", "memo.create", objectSchema(
+			properties(
+				prop("title", stringSchema("备忘录标题，一句话概括")),
+				prop("content", stringSchema("备忘录正文或原始说明")),
+				prop("links", arraySchema("链接列表", stringSchema("URL"))),
+				prop("tags", arraySchema("标签列表，例如项目名、客户名、技术栈", stringSchema("标签"))),
+				prop("chat_id", stringSchema("来源会话 ID，通常由系统自动注入")),
+			),
+			"title",
+		)),
+		newMemoTool(exec, "memo_search", "搜索备忘录资料。", "memo.search", objectSchema(
+			properties(
+				prop("query", stringSchema("关键词，例如项目名、链接关键词或资料片段")),
+				prop("tags", arraySchema("必须匹配的标签", stringSchema("标签"))),
+				prop("limit", numberSchema("最多返回条数")),
+			),
+		)),
+		newMemoTool(exec, "memo_list", "列出最近保存的备忘录。", "memo.list", objectSchema(
+			properties(prop("limit", numberSchema("最多返回条数"))),
+		)),
+		newMemoTool(exec, "memo_update", "更新备忘录。", "memo.update", objectSchema(
+			properties(
+				prop("id", stringSchema("备忘录 ID 或前缀")),
+				prop("title", stringSchema("新标题")),
+				prop("content", stringSchema("新正文")),
+				prop("links", arraySchema("新链接列表", stringSchema("URL"))),
+				prop("tags", arraySchema("新标签列表", stringSchema("标签"))),
+			),
+			"id",
+		)),
+		newMemoTool(exec, "memo_delete", "删除备忘录。", "memo.delete", objectSchema(
+			properties(prop("id", stringSchema("备忘录 ID 或前缀"))),
+			"id",
+		)),
+	}
+}
+
+func newTodoTool(exec *todo.ToolExecutor, name, description, domainName string, schema *trpctool.Schema) *agentTool {
+	return &agentTool{
+		name:        name,
+		description: description,
+		domainName:  domainName,
+		inputSchema: schema,
+		call: func(ctx context.Context, args map[string]interface{}) (any, toolResultView, error) {
+			res, err := exec.ExecuteContext(ctx, todo.ToolCall{Name: domainName, Args: args})
+			return res, todoResultView(res), err
+		},
+	}
+}
+
+func newMemoTool(exec *memo.ToolExecutor, name, description, domainName string, schema *trpctool.Schema) *agentTool {
+	return &agentTool{
+		name:        name,
+		description: description,
+		domainName:  domainName,
+		inputSchema: schema,
+		call: func(ctx context.Context, args map[string]interface{}) (any, toolResultView, error) {
+			res, err := exec.ExecuteContext(ctx, memo.ToolCall{Name: domainName, Args: args})
+			return res, memoResultView(res), err
+		},
+	}
 }
 
 func idSchema() *trpctool.Schema {
@@ -1317,6 +1471,10 @@ func boolSchema(description string) *trpctool.Schema {
 
 func numberSchema(description string) *trpctool.Schema {
 	return &trpctool.Schema{Type: "integer", Description: description}
+}
+
+func arraySchema(description string, item *trpctool.Schema) *trpctool.Schema {
+	return &trpctool.Schema{Type: "array", Description: description, Items: item}
 }
 
 func enumSchema(description string, values ...string) *trpctool.Schema {
